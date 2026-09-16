@@ -272,7 +272,7 @@ app.get('/api/race/:id', async (req, res) => {
 app.get('/api/jockeys/top2', async (_req, res) => {
   try {
     let today = cache.get('today')?.data;
-    if (!today) { today = await enrichToday(); cache.set('today', { time: Date.now(), data: today }); }
+    if (!today) { try { today = await enrichToday(); } catch (e) { const d = new Date(); d.setUTCDate(d.getUTCDate() + 1); today = await enrichDate(d.toISOString().slice(0,10)); } cache.set('today', { time: Date.now(), data: today }); }
     const races = extractRaceArray(today);
     const map = new Map();
     for (const r of races) {
