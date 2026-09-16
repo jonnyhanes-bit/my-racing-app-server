@@ -216,10 +216,20 @@ async function mapLimit(items, limit, fn) {
 }
 
 async function enrichToday() {
-  const raw = await racingAlpha('/today');
-  const races = extractRaceArray(raw);
-  const out = await mapLimit(races, 4, enrichRace);
-  return { ...((raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {}), races: out.filter(Boolean) };
+  const d = new Date();
+  const date = d.toISOString().slice(0, 10);
+
+  try {
+    const raw = await racingAlpha('/today');
+    const races = extractRaceArray(raw);
+    const out = await mapLimit(races, 4, enrichRace);
+    return {
+      ...((raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {}),
+      races: out.filter(Boolean)
+    };
+  } catch (e) {
+    return await enrichDate(date);
+  }
 }
 
 function jockeyFromRacecardRunner(r) {
