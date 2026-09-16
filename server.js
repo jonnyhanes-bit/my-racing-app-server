@@ -292,4 +292,101 @@ app.get('/api/jockeys/top2', async (_req, res) => {
   } catch (e) { res.status(503).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`Racing app API v3 listening on ${PORT}`));
+const DATE_TTL = 5 * 60 * 1000;
+
+function parseDatePage(html, date) {
+  const $ = cheerio.load(html);
+  const races = [];
+  let meeting = 'Unknown meeting';
+
+  $('h1,h2,h3,a[href*="/racecards/rac_"]').each((_, el) => {
+    const tag = (el.tagName || '').toLowerCase();
+    const text = cleanText($(el).text());
+    if (!text) return;
+
+    if (tag === 'h2') {
+      meeting = text;
+      return;
+    }
+
+    if (tag !== 'a') return;
+
+    const href = $(el).attr('href') || '';
+    const m = href.match(/\/racecards\/(rac_[A-Za-z0-9_-]+)/i);
+    if (!m) return;
+
+    const time = (text.match(/\b\d{1,2}:\d{2}\b/) || [])[0] || '';
+    const name = cleanText(text.replace(/^\d{1,2}:\d{2}\s*/, ''));
+    const id = m[1];
+
+    if (races.some(r => r.id === id)) return;
+
+    races.push({
+      id,
+      race_id: id,
+      course: meeting,
+      meeting,
+      time,
+      name,
+      race_name: name,
+      racecard_url: `${WEB}/racecards/${id}`,
+      date
+    });
+  });
+
+  return races;
+}
+
+async function enrichDate(date) {
+  const html = await getHTML(`${WEB}/racecards?date=${encodeURIComponent(date)}`);
+  const base = parseDatePage(html, date);
+  const out = await mapLimit(base, 4, enrichRace);
+  return {
+    date,
+    races: out.filter(Boolean),
+    source: `${WEB}/racecards?date=${encodeURIComponent(date)}`
+  };
+}
+
+app.get('/api/date', async (req, res) => {
+  try {
+    const date = String(req.query.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Use date=YYYY-MM-DD' });
+    }
+
+    const key = `date:${date}`;
+    const hit = cache.get(key);
+
+    if (hit && Date.now() - hit.time < DATE_TTL) {
+      return res.json(hit.data);
+    }
+
+    const data = await enrichDate(date);
+    cache.set(key, { time: Date.now(), data });
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.get('/api/tomorrow', async (_req, res) => {
+  try {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() + 1);
+    const date = d.toISOString().slice(0, 10);
+
+    const key = `date:${date}`;
+    const hit = cache.get(key);
+
+    if (hit && Date.now() - hit.time < DATE_TTL) {
+      return res.json(hit.data);
+    }
+
+    const data = await enrichDate(date);
+    cache.set(key, { time: Date.now(), data });
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});app.listen(PORT, () => console.log(`Racing app API v3 listening on ${PORT}`));
