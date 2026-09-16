@@ -1,12 +1,11 @@
 {
   "name": "my-racing-app-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^4.21.2"
   }
 }
