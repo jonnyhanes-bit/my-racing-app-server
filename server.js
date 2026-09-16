@@ -198,8 +198,8 @@ async function enrichRace(r) {
 } catch (e) {
   return { ...r, _racecard_error: e.message };
   }
-  
-
+  }
+}
 
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
