@@ -192,12 +192,14 @@ async function enrichRace(r) {
     ]);
     return { ...r, _signals: detail, _detail: detail, _racecard: card, _runners: enrichDetail(detail, card)._runners };
   } catch (e) {
-    try {
-      const detail = await racingAlpha(`/races/${encodeURIComponent(id)}`);
-      return { ...r, _signals: detail, _detail: detail, _racecard_error: e.message };
-    } catch { return { ...r, _racecard_error: e.message }; }
+  try {
+  const card = await fetchRacecard(id);
+  return { ...r, _racecard: card, _runners: card.runners, _racecard_error: e.message };
+} catch (e) {
+  return { ...r, _racecard_error: e.message };
   }
-}
+  
+
 
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
