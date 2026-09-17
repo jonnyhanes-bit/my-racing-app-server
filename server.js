@@ -17,9 +17,16 @@ const DATE_TTL = 5 * 60 * 1000;
 const CARD_TTL = 15 * 60 * 1000;
 const JOCKEY_TTL = 30 * 60 * 1000;
 
+async function fetchWithTimeout(url, options = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+}
+
 async function getJSON(url) {
   const headers = API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
-  const r = await fetch(url, { headers });
+  const r = await fetchWithTimeout(url, { headers }, 8000);
   const text = await r.text();
   if (!r.ok) throw new Error(`Racing Alpha ${r.status}: ${text.slice(0, 250)}`);
   try { return JSON.parse(text); } catch { throw new Error('Racing Alpha returned non-JSON data'); }
@@ -28,12 +35,12 @@ async function getJSON(url) {
 async function racingAlpha(path) { return getJSON(BASE + path); }
 
 async function getHTML(url) {
-  const r = await fetch(url, {
+  const r = await fetchWithTimeout(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; MyRacingApp/3.0)',
       'Accept': 'text/html,application/xhtml+xml'
     }
-  });
+  }, 8000);
   const text = await r.text();
   if (!r.ok) throw new Error(`Racing Alpha web ${r.status}: ${text.slice(0, 200)}`);
   return text;
@@ -251,7 +258,7 @@ function parseDatePage(html, date) {
 async function enrichDate(date) {
   const html = await getHTML(`${WEB}/racecards?date=${encodeURIComponent(date)}`);
   const base = parseDatePage(html, date);
-  const out = await mapLimit(base, 4, enrichRace);
+  const out = await mapLimit(base, 2, enrichRace);
   return { date, races: out.filter(Boolean), source: `${WEB}/racecards?date=${encodeURIComponent(date)}` };
 }
 
@@ -323,7 +330,7 @@ async function getJockeyForm(profileUrl, days = 14) {
   return data;
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '5' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '6' }));
 
 
 app.get('/api/date', async (req, res) => {
@@ -376,7 +383,13 @@ app.get('/api/jockeys/top2', async (req, res) => {
   try {
     const days = String(req.query.days || '14') === '3' ? 3 : 14;
     let today = cache.get('today')?.data;
-    if (!today) { today = await enrichToday(); cache.set('today', { time: Date.now(), data: today }); }
+    if (!today) {
+      const date = ukTodayISO();
+      const key = `date:${date}`;
+      today = cache.get(key)?.data;
+      if (!today) { today = await enrichDate(date); cache.set(key, { time: Date.now(), data: today }); }
+      cache.set('today', { time: Date.now(), data: today });
+    }
     const races = extractRaceArray(today);
     const map = new Map();
     for (const r of races) {
@@ -386,8 +399,8 @@ app.get('/api/jockeys/top2', async (req, res) => {
         map.set(h.jockey_url, jockeyFromRacecardRunner(h));
       }
     }
-    const candidates = [...map.values()];
-    const forms = await mapLimit(candidates, 6, async j => {
+    const candidates = [...map.values()].slice(0, 18);
+    const forms = await mapLimit(candidates, 4, async j => {
       try { return await getJockeyForm(j.url, days); } catch { return null; }
     });
     const minimumRides = days === 3 ? 3 : 10;
