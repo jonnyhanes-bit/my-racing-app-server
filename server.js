@@ -13,6 +13,7 @@ const WEB = 'https://racingalpha.co.uk';
 
 const cache = new Map();
 const TODAY_TTL = 5 * 60 * 1000;
+const DATE_TTL = 5 * 60 * 1000;
 const CARD_TTL = 15 * 60 * 1000;
 const JOCKEY_TTL = 30 * 60 * 1000;
 
@@ -192,12 +193,10 @@ async function enrichRace(r) {
     ]);
     return { ...r, _signals: detail, _detail: detail, _racecard: card, _runners: enrichDetail(detail, card)._runners };
   } catch (e) {
-  try {
-  const card = await fetchRacecard(id);
-  return { ...r, _racecard: card, _runners: card.runners, _racecard_error: e.message };
-} catch (e) {
-  return { ...r, _racecard_error: e.message };
-  }
+    try {
+      const detail = await racingAlpha(`/races/${encodeURIComponent(id)}`);
+      return { ...r, _signals: detail, _detail: detail, _racecard_error: e.message };
+    } catch { return { ...r, _racecard_error: e.message }; }
   }
 }
 
@@ -216,20 +215,44 @@ async function mapLimit(items, limit, fn) {
 }
 
 async function enrichToday() {
-  const d = new Date();
-  const date = d.toISOString().slice(0, 10);
+  const raw = await racingAlpha('/today');
+  const races = extractRaceArray(raw);
+  const out = await mapLimit(races, 4, enrichRace);
+  return { ...((raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {}), races: out.filter(Boolean) };
+}
 
-  try {
-    const raw = await racingAlpha('/today');
-    const races = extractRaceArray(raw);
-    const out = await mapLimit(races, 4, enrichRace);
-    return {
-      ...((raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {}),
-      races: out.filter(Boolean)
-    };
-  } catch (e) {
-    return await enrichDate(date);
-  }
+function parseDatePage(html, date) {
+  const $ = cheerio.load(html);
+  const races = [];
+  let meeting = 'Unknown meeting';
+  let country = '';
+  $('h1,h2,h3,a[href*="/racecards/rac_"]').each((_, el) => {
+    const tag = (el.tagName || '').toLowerCase();
+    const text = cleanText($(el).text());
+    if (!text) return;
+    if (tag === 'h2') {
+      meeting = text;
+      country = '';
+      return;
+    }
+    if (tag !== 'a') return;
+    const href = $(el).attr('href') || '';
+    const m = href.match(/\/racecards\/(rac_[A-Za-z0-9_-]+)/i);
+    if (!m) return;
+    const time = (text.match(/\b\d{1,2}:\d{2}\b/) || [])[0] || '';
+    const name = cleanText(text.replace(/^\d{1,2}:\d{2}\s*/, ''));
+    const id = m[1];
+    if (races.some(r => r.id === id)) return;
+    races.push({ id, race_id: id, course: meeting, meeting, time, name, race_name: name, racecard_url: `${WEB}/racecards/${id}`, date });
+  });
+  return races;
+}
+
+async function enrichDate(date) {
+  const html = await getHTML(`${WEB}/racecards?date=${encodeURIComponent(date)}`);
+  const base = parseDatePage(html, date);
+  const out = await mapLimit(base, 4, enrichRace);
+  return { date, races: out.filter(Boolean), source: `${WEB}/racecards?date=${encodeURIComponent(date)}` };
 }
 
 function jockeyFromRacecardRunner(r) {
@@ -239,14 +262,53 @@ function jockeyFromRacecardRunner(r) {
   };
 }
 
-async function getJockeyForm(profileUrl) {
-  const key = `jockey:${profileUrl}`;
+function ukTodayISO() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+}
+
+function parseRecentRideForm($, days) {
+  const todayISO = ukTodayISO();
+  const today = new Date(`${todayISO}T00:00:00Z`);
+  const cutoff = new Date(today);
+  cutoff.setUTCDate(cutoff.getUTCDate() - (days - 1));
+  let wins = 0, settled = 0;
+
+  $('tr').each((_, tr) => {
+    const cells = $(tr).find('th,td').map((__, el) => cleanText($(el).text())).get();
+    if (cells.length < 3) return;
+    const dateText = cells[0] || '';
+    const dm = dateText.match(/^(\d{1,2})\s+([A-Za-z]{3,9})$/);
+    if (!dm) return;
+    const monthNames = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11};
+    const month = monthNames[dm[2].toLowerCase().slice(0,4).replace('sept','sept')] ?? monthNames[dm[2].toLowerCase().slice(0,3)];
+    if (month == null) return;
+    let d = new Date(Date.UTC(today.getUTCFullYear(), month, Number(dm[1])));
+    if (d > new Date(today.getTime() + 86400000)) d.setUTCFullYear(d.getUTCFullYear() - 1);
+    if (d < cutoff || d > today) return;
+    const result = cleanText(cells[cells.length - 1]).toLowerCase();
+    if (!result || /result$/i.test(result)) return;
+    if (/non[- ]?runner|nr|void|abandoned|not run/i.test(result)) return;
+    if (/won|winner|\b1st\b|first/i.test(result)) { wins++; settled++; return; }
+    if (/lost|placed|\b[2-9](?:th|nd|rd|st)?\b|pulled up|fell|unseated|refused|brought down|tailed off|finished/i.test(result)) { settled++; }
+  });
+
+  return { wins, rides: settled, strikeRate: settled ? Number((wins / settled * 100).toFixed(1)) : null, days };
+}
+
+async function getJockeyForm(profileUrl, days = 14) {
+  const key = `jockey:${days}:${profileUrl}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.time < JOCKEY_TTL) return hit.data;
   const html = await getHTML(profileUrl);
   const $ = cheerio.load(html);
   const name = cleanText($('h1').first().text()) || '';
   const body = cleanText($('body').text());
+  if (days === 3) {
+    const recent = parseRecentRideForm($, 3);
+    const data = { name, url: profileUrl, strikeRate: recent.strikeRate, rides: recent.rides, wins: recent.wins, days: 3 };
+    cache.set(key, { time: Date.now(), data });
+    return data;
+  }
   const m = body.match(/Strike\s*\(14d\)\s*(\d+(?:\.\d+)?)%/i);
   const rides = body.match(/(\d+)\s*(?:settled rides|rides)\s*(?:Rides 14d)?/i) || body.match(/Rides 14d\s*(\d+)/i);
   const settled = body.match(/(\d+)W\s*\/\s*(\d+)\s*settled/i);
@@ -254,13 +316,42 @@ async function getJockeyForm(profileUrl) {
     name,
     url: profileUrl,
     strikeRate: m ? Number(m[1]) : null,
-    rides: settled ? Number(settled[2]) : (rides ? Number(rides[1]) : 0)
+    rides: settled ? Number(settled[2]) : (rides ? Number(rides[1]) : 0),
+    days: 14
   };
   cache.set(key, { time: Date.now(), data });
   return data;
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '3' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '5' }));
+
+
+app.get('/api/date', async (req, res) => {
+  try {
+    const date = String(req.query.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Use date=YYYY-MM-DD' });
+    const key = `date:${date}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.time < DATE_TTL) return res.json(hit.data);
+    const data = await enrichDate(date);
+    cache.set(key, { time: Date.now(), data });
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get('/api/tomorrow', async (_req, res) => {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + 1);
+  const date = d.toISOString().slice(0,10);
+  try {
+    const key = `date:${date}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.time < DATE_TTL) return res.json(hit.data);
+    const data = await enrichDate(date);
+    cache.set(key, { time: Date.now(), data });
+    res.json(data);
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
 
 app.get('/api/today', async (_req, res) => {
   try {
@@ -281,10 +372,11 @@ app.get('/api/race/:id', async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-app.get('/api/jockeys/top2', async (_req, res) => {
+app.get('/api/jockeys/top2', async (req, res) => {
   try {
+    const days = String(req.query.days || '14') === '3' ? 3 : 14;
     let today = cache.get('today')?.data;
-    if (!today) { try { today = await enrichToday(); } catch (e) { const d = new Date(); d.setUTCDate(d.getUTCDate() + 1); today = await enrichDate(d.toISOString().slice(0,10)); } cache.set('today', { time: Date.now(), data: today }); }
+    if (!today) { today = await enrichToday(); cache.set('today', { time: Date.now(), data: today }); }
     const races = extractRaceArray(today);
     const map = new Map();
     for (const r of races) {
@@ -296,109 +388,18 @@ app.get('/api/jockeys/top2', async (_req, res) => {
     }
     const candidates = [...map.values()];
     const forms = await mapLimit(candidates, 6, async j => {
-      try { return await getJockeyForm(j.url); } catch { return null; }
+      try { return await getJockeyForm(j.url, days); } catch { return null; }
     });
-    const ranked = forms.filter(x => x && x.name && Number.isFinite(x.strikeRate) && x.rides >= 10)
+    const minimumRides = days === 3 ? 3 : 10;
+    const ranked = forms.filter(x => x && x.name && Number.isFinite(x.strikeRate) && x.rides >= minimumRides)
       .sort((a,b) => (b.strikeRate - a.strikeRate) || (b.rides - a.rides));
-    res.json({ jockeys: ranked.slice(0, 2), basis: 'Racing Alpha public 14-day jockey form; minimum 10 settled rides; Saffie Osborne excluded from top-two slot', candidates: candidates.length });
+    res.json({
+      jockeys: ranked.slice(0, 2),
+      days,
+      basis: `Racing Alpha recent settled rides over the last ${days} days; minimum ${minimumRides} settled rides; Saffie Osborne excluded from top-two slot`,
+      candidates: candidates.length
+    });
   } catch (e) { res.status(503).json({ error: e.message }); }
 });
 
-const DATE_TTL = 5 * 60 * 1000;
-
-function parseDatePage(html, date) {
-  const $ = cheerio.load(html);
-  const races = [];
-  let meeting = 'Unknown meeting';
-
-  $('h1,h2,h3,a[href*="/racecards/rac_"]').each((_, el) => {
-    const tag = (el.tagName || '').toLowerCase();
-    const text = cleanText($(el).text());
-    if (!text) return;
-
-    if (tag === 'h2') {
-      meeting = text;
-      return;
-    }
-
-    if (tag !== 'a') return;
-
-    const href = $(el).attr('href') || '';
-    const m = href.match(/\/racecards\/(rac_[A-Za-z0-9_-]+)/i);
-    if (!m) return;
-
-    const time = (text.match(/\b\d{1,2}:\d{2}\b/) || [])[0] || '';
-    const name = cleanText(text.replace(/^\d{1,2}:\d{2}\s*/, ''));
-    const id = m[1];
-
-    if (races.some(r => r.id === id)) return;
-
-    races.push({
-      id,
-      race_id: id,
-      course: meeting,
-      meeting,
-      time,
-      name,
-      race_name: name,
-      racecard_url: `${WEB}/racecards/${id}`,
-      date
-    });
-  });
-
-  return races;
-}
-
-async function enrichDate(date) {
-  const html = await getHTML(`${WEB}/racecards?date=${encodeURIComponent(date)}`);
-  const base = parseDatePage(html, date);
-  const out = await mapLimit(base, 4, enrichRace);
-  return {
-    date,
-    races: out.filter(Boolean),
-    source: `${WEB}/racecards?date=${encodeURIComponent(date)}`
-  };
-}
-
-app.get('/api/date', async (req, res) => {
-  try {
-    const date = String(req.query.date || '').trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return res.status(400).json({ error: 'Use date=YYYY-MM-DD' });
-    }
-
-    const key = `date:${date}`;
-    const hit = cache.get(key);
-
-    if (hit && Date.now() - hit.time < DATE_TTL) {
-      return res.json(hit.data);
-    }
-
-    const data = await enrichDate(date);
-    cache.set(key, { time: Date.now(), data });
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
-});
-
-app.get('/api/tomorrow', async (_req, res) => {
-  try {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() + 1);
-    const date = d.toISOString().slice(0, 10);
-
-    const key = `date:${date}`;
-    const hit = cache.get(key);
-
-    if (hit && Date.now() - hit.time < DATE_TTL) {
-      return res.json(hit.data);
-    }
-
-    const data = await enrichDate(date);
-    cache.set(key, { time: Date.now(), data });
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
-});app.listen(PORT, () => console.log(`Racing app API v3 listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Racing app API v3 listening on ${PORT}`));
