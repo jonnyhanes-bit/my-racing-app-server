@@ -16,10 +16,16 @@ const TODAY_TTL = 5 * 60 * 1000;
 const DATE_TTL = 5 * 60 * 1000;
 const CARD_TTL = 15 * 60 * 1000;
 const JOCKEY_TTL = 30 * 60 * 1000;
+const UPSTREAM_TIMEOUT = 12000;
 
 async function getJSON(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
   const headers = API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
-  const r = await fetch(url, { headers });
+  let r;
+  try { r = await fetch(url, { headers, signal: controller.signal }); }
+  catch (e) { throw new Error(e?.name === 'AbortError' ? `Racing Alpha request timed out after ${UPSTREAM_TIMEOUT/1000}s` : e.message); }
+  finally { clearTimeout(timer); }
   const text = await r.text();
   if (!r.ok) throw new Error(`Racing Alpha ${r.status}: ${text.slice(0, 250)}`);
   try { return JSON.parse(text); } catch { throw new Error('Racing Alpha returned non-JSON data'); }
@@ -28,12 +34,17 @@ async function getJSON(url) {
 async function racingAlpha(path) { return getJSON(BASE + path); }
 
 async function getHTML(url) {
-  const r = await fetch(url, {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
+  let r;
+  try { r = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; MyRacingApp/3.0)',
       'Accept': 'text/html,application/xhtml+xml'
     }
-  });
+  }); }
+  catch (e) { throw new Error(e?.name === 'AbortError' ? `Racing Alpha web timed out after ${UPSTREAM_TIMEOUT/1000}s` : e.message); }
+  finally { clearTimeout(timer); }
   const text = await r.text();
   if (!r.ok) throw new Error(`Racing Alpha web ${r.status}: ${text.slice(0, 200)}`);
   return text;
@@ -249,10 +260,22 @@ function parseDatePage(html, date) {
 }
 
 async function enrichDate(date) {
-  // Return the date's race headers only. Do NOT enrich every race here:
-  // doing so makes the whole /api/date request depend on many slow racecard
-  // requests and can cause Render 502/timeouts. Individual racecards are
-  // fetched lazily by /api/race/:id when the user selects a race.
+  // Today's card is available through Racing Alpha's supported JSON API.
+  // Use it instead of scraping the public racecards page. Tomorrow/other
+  // dates fall back to the public date page because the API intentionally
+  // exposes /today rather than a raw arbitrary-date racecard feed.
+  const today = ukTodayISO();
+  if (date === today) {
+    const raw = await racingAlpha('/today');
+    const races = extractRaceArray(raw).map(r => ({
+      ...r,
+      id: raceId(r),
+      race_id: raceId(r),
+      date,
+      racecard_url: raceId(r) ? `${WEB}/racecards/${raceId(r)}` : ''
+    }));
+    return { date, races, source: `${BASE}/today` };
+  }
   const html = await getHTML(`${WEB}/racecards?date=${encodeURIComponent(date)}`);
   const races = parseDatePage(html, date);
   return { date, races, source: `${WEB}/racecards?date=${encodeURIComponent(date)}` };
@@ -326,7 +349,7 @@ async function getJockeyForm(profileUrl, days = 14) {
   return data;
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '7' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, provider: 'Racing Alpha', version: '8' }));
 
 
 app.get('/api/date', async (req, res) => {
@@ -420,4 +443,4 @@ app.get('/api/jockeys/top2', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Racing app API v7 listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Racing app API v8 listening on ${PORT}`));
